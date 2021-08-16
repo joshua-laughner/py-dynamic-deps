@@ -5,7 +5,7 @@ from glob import glob
 from pathlib import Path
 import re
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence
 from .types import pathlike, strseq
 
 
@@ -100,10 +100,10 @@ class DependencyTree:
 
 
 class TreeNode:
-    def __init__(self, file: pathlike) -> None:
+    def __init__(self, file: pathlike, depends_on=None, dependent_to=None) -> None:
         self.file = str(file)
-        self._depends_on = set()
-        self._dependent_to = set()
+        self._depends_on = set() if depends_on is None else set(depends_on)
+        self._dependent_to = set() if dependent_to is None else set(dependent_to)
 
     @property
     def key(self):
@@ -210,11 +210,11 @@ class OneToOnePatternDependency(Dependency):
         self._glob_recursive = glob_recursive
         self._how = how
 
-    def get_files_to_update(self) -> strseq:
+    def get_files_to_update(self) -> Sequence[TreeNode]:
         to_update = []
         for input_file, output_file in self.iter_files():
             if self.is_out_of_date(input_file, output_file, how=self._how):
-                to_update.append(input_file)
+                to_update.append(TreeNode(output_file, [input_file]))
 
         return tuple(to_update)
 
@@ -272,10 +272,10 @@ class ManyToOnePatternDependency(Dependency):
         self._glob_recursive = glob_recursive
         self._how = how
 
-    def get_files_to_update(self) -> strseq:
+    def get_files_to_update(self) -> Sequence[TreeNode]:
         input_files = glob(self._from_pattern, recursive=self._glob_recursive)
         if self.is_out_of_date(input_files, self._to_file, how=self._how):
-            return (str(self._to_file), )
+            return (TreeNode(self._to_file, input_files), )
         else:
             return tuple()
 
@@ -350,10 +350,10 @@ class ManyToVariableOnePatternDependency(Dependency):
         self._glob_recursive = glob_recursive
         self._how = how
 
-    def get_files_to_update(self) -> strseq:
+    def get_files_to_update(self) -> Sequence[TreeNode]:
         input_files = glob(self._from_pattern, recursive=self._glob_recursive)
         if self.is_out_of_date(input_files, self._to_file, how=self._how, output_alt_path_key=self._to_pattern):
-            return (str(self._to_file), )
+            return (TreeNode(self._to_file, input_files), )
         else:
             return tuple()
 

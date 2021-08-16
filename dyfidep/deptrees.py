@@ -1,58 +1,164 @@
+import json
 from abc import ABC, abstractmethod
 from enum import Enum
 from glob import glob
 from pathlib import Path
 import re
 
-from typing import Optional
+from typing import Optional, Tuple
 from .types import pathlike, strseq
 
 
-class UpdateCheckMethodType(Enum):
-    MTIME = 'mtime'
+class DependencyError(Exception):
+    pass
 
 
-class UpdateCheckMethod:
-    def __init__(self, how, cache_file=None):
-        self.how = how
+class UpdateCheckMethod(ABC):
+    def __init__(self, cache_file=None):
         self.cache_file = cache_file
 
     def __repr__(self):
-        clsname = self.__class__.__name__
-        stem = '{} by {}'.format(clsname, self.how.name)
+        stem = self.__class__.__name__
         if self.cache_file is not None:
             return '<{} (cache_file={})>'.format(stem, self.cache_file)
         else:
             return '<{}>'.format(stem)
 
-    @classmethod
-    def default(cls):
-        cls(UpdateCheckMethodType.MTIME)
+    @abstractmethod
+    def is_update_required(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None) -> bool:
+        pass
+
+    @abstractmethod
+    def update_cache(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None):
+        pass
+
+
+class UpdateByMtime(UpdateCheckMethod):
+    def is_update_required(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None) -> bool:
+        return _compare_mtimes(input_files, output_file)
+
+    def update_cache(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None):
+        pass
+
+
+class UpdateByMtimeAndExistance(UpdateCheckMethod):
+    def __init__(self, cache_file=None):
+        if cache_file is None:
+            raise TypeError('cache_file cannot be None for this class')
+        super().__init__(cache_file=cache_file)
+
+    def is_update_required(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None) -> bool:
+        cached_list = self._get_json()
+
+        # First test that which input files are required has not changed
+        key = self._get_key(output_file, output_alt_path_key)
+        previous_files = set(cached_list.get(key, tuple()))
+        current_files = set(str(Path(f).resolve()) for f in input_files)
+        if previous_files != current_files:
+            return True
+
+        # Then if the list of prequisite files is the same, check their modification times
+        return _compare_mtimes(input_files, output_file)
+
+    def update_cache(self, input_files: strseq, output_file: str, output_alt_path_key: Optional[str] = None):
+        cached_list = self._get_json()
+
+        key = self._get_key(output_file, output_alt_path_key)
+        cached_list[key] = sorted(str(Path(i).resolve()) for i in input_files)
+        with open(self.cache_file, 'w') as f:
+            json.dump(cached_list, f, indent=2)
+
+    def _get_json(self):
+        if not Path(self.cache_file).exists():
+            return dict()
+
+        with open(self.cache_file) as f:
+            return json.load(f)
+
+    @staticmethod
+    def _get_key(output_file: str, output_alt_path_key: Optional[str] = None) -> str:
+        if output_alt_path_key is None:
+            return str(Path(output_file).resolve())
+        else:
+            return str(Path(output_alt_path_key).resolve())
+
+
+def _compare_mtimes(input_files: strseq, output_file: str) -> bool:
+    output_mtime = Path(output_file).stat().st_mtime
+    for input_file in input_files:
+        input_mtime = Path(input_file).stat().st_mtime
+        if input_mtime > output_mtime:
+            return True
+
+    return False
 
 
 class DependencyTree:
-    def __init__(self):
+    def __init__(self, how: UpdateCheckMethod):
         self.files = dict()
+        self._how = how
+
+
+class TreeNode:
+    def __init__(self, file: pathlike) -> None:
+        self.file = str(file)
+        self._depends_on = set()
+        self._dependent_to = set()
+
+    @property
+    def key(self):
+        return str(Path(self.file).resolve())
+
+    def add_dependency(self, input_file):
+        if not isinstance(input_file, self.__class__):
+            raise TypeError('input_file must be another TreeNode')
+        self._depends_on.add(input_file.key)
+        input_file._dependent_to.add(self.key)
 
 
 class Dependency(ABC):
     @abstractmethod
-    def get_files_to_update(self, how: UpdateCheckMethod = UpdateCheckMethod.default()) -> strseq:
+    def get_files_to_update(self) -> strseq:
+        pass
+
+    @abstractmethod
+    def get_dependency_pairs(self) -> Tuple[Tuple[str, str]]:
+        pass
+
+    @abstractmethod
+    def set_files_updated(self):
+        pass
+
+    @abstractmethod
+    def iter_files(self):
         pass
 
     @classmethod
-    def is_out_of_date(cls, input_files, output_file, how: UpdateCheckMethod = UpdateCheckMethod.default()):
+    def is_out_of_date(cls, input_files, output_file, how: UpdateCheckMethod = UpdateByMtime(),
+                       output_alt_path_key: Optional[str] = None):
         output_file = Path(output_file)
         if not output_file.exists():
             return True
 
-        output_mtime = output_file.stat().st_mtime
-        for input_file in input_files:
-            input_mtime = Path(input_file).stat().st_mtime
-            if input_mtime > output_mtime:
-                return True
+        return how.is_update_required(input_files, str(output_file), output_alt_path_key=output_alt_path_key)
 
-        return False
+    @classmethod
+    def can_be_removed(cls, input_files: strseq, output_file: str):
+        return len(input_files) == 0
+
+    @classmethod
+    def mark_updated(cls, input_files: strseq, output_file: str, how: UpdateCheckMethod = UpdateByMtime(),
+                     output_alt_path_key: Optional[str] = None):
+        how.update_cache(input_files, output_file, output_alt_path_key=output_alt_path_key)
+
+    def get_input_output_files(self):
+        input_files = set()
+        output_files = set()
+        for inp, outp in self.iter_files():
+            input_files.add(inp)
+            output_files.add(outp)
+
+        return sorted(input_files), sorted(output_files)
 
 
 class OneToOnePatternDependency(Dependency):
@@ -97,20 +203,36 @@ class OneToOnePatternDependency(Dependency):
         Passed to the `recursive` parameter of :func:`glob.glob` when finding all
         the input files.
     """
-    def __init__(self, from_pattern: str, to_pattern: str, glob_recursive: bool = False) -> None:
+    def __init__(self, from_pattern: str, to_pattern: str, glob_recursive: bool = False,
+                 how: UpdateCheckMethod = UpdateByMtime()) -> None:
         self._from_pattern = from_pattern
         self._regex, self._subst, _ = _PatternParser(to_pattern).parse()
         self._glob_recursive = glob_recursive
+        self._how = how
 
-    def get_files_to_update(self, how: UpdateCheckMethod = UpdateCheckMethod.default()) -> strseq:
-        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+    def get_files_to_update(self) -> strseq:
         to_update = []
-        for input_file in input_files:
-            output_file = re.sub(self._regex, self._subst, input_file)
-            if self.is_out_of_date(input_file, output_file, how=how):
+        for input_file, output_file in self.iter_files():
+            if self.is_out_of_date(input_file, output_file, how=self._how):
                 to_update.append(input_file)
 
         return tuple(to_update)
+
+    def get_dependency_pairs(self) -> Tuple[Tuple[str, str]]:
+        pairs = []
+        for input_file, output_file in self.iter_files():
+            pairs.append((str(input_file), str(output_file)))
+        return tuple(pairs)
+
+    def set_files_updated(self):
+        for input_file, output_file in self.iter_files():
+            self.mark_updated([input_file], output_file, how=self._how)
+
+    def iter_files(self) -> Tuple[strseq, str]:
+        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        for input_file in input_files:
+            output_file = re.sub(self._regex, self._subst, input_file)
+            yield input_file, output_file
 
 
 class ManyToOnePatternDependency(Dependency):
@@ -143,17 +265,111 @@ class ManyToOnePatternDependency(Dependency):
         Passed to the `recursive` parameter of :func:`glob.glob` when finding all
         the input files.
     """
-    def __init__(self, from_pattern: str, to_file: pathlike, glob_recursive: bool = False) -> None:
+    def __init__(self, from_pattern: str, to_file: pathlike, glob_recursive: bool = False,
+                 how: UpdateCheckMethod = UpdateByMtime()) -> None:
         self._from_pattern = from_pattern
         self._to_file = to_file
         self._glob_recursive = glob_recursive
+        self._how = how
 
-    def get_files_to_update(self, how: UpdateCheckMethod = UpdateCheckMethod.default()) -> strseq:
+    def get_files_to_update(self) -> strseq:
         input_files = glob(self._from_pattern, recursive=self._glob_recursive)
-        if self.is_out_of_date(input_files, self._to_file, how=how):
+        if self.is_out_of_date(input_files, self._to_file, how=self._how):
             return (str(self._to_file), )
         else:
             return tuple()
+
+    def get_dependency_pairs(self) -> Tuple[Tuple[str, str]]:
+        return tuple(p for p in self.iter_files())
+
+    def set_files_updated(self):
+        input_files, output_files = self.get_input_output_files()
+        self.mark_updated(input_files, output_files[0], how=self._how)
+
+    def iter_files(self):
+        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        output_file = str(self._to_file)
+        for input_file in input_files:
+            yield str(input_file), output_file
+
+
+class ManyToVariableOnePatternDependency(Dependency):
+    """Represents an abstract many to one dependency relationship where the output file name is not known
+
+    This class allows you to define a relationship where a single output
+    file depends on many input files according to a pattern. That is, only
+    when asked whether its output file needs updated will it resolve which
+    input files it requires, based on which ones are present. For example,
+    if you are compiling the executable `cool-program` that depends on
+    all `.c` files under `src/`, this class can define that relationship.
+
+    Additionally, this class waits to resolve the path to the output file
+    until queried for whether an update is required. The path to the output
+    file can be a glob pattern, but it must only ever match 0 or 1 files.
+    This is useful if the name of the output file is not specifically known
+    but follows some general pattern. Note that this makes it important to
+    clean up old versions of the output file!
+
+    As all :class:`Dependency` subclasses, this class has a
+    :meth:`get_files_to_update` method that returns a tuple of which output
+    files need updated. In this case, there will only every be zero or
+    one files in that tuple. If any of the input files has changed since
+    the output file was last updated, it will be listed in the update tuple.
+
+    Parameters
+    ----------
+    from_pattern
+        This is a glob-style pattern used to match input files. It can be
+        any valid pattern for :func:`glob.glob`. Note that to enable recursive
+        globbing (using the `**` wildcard), `glob_recursive` must be `True`.
+
+    to_file
+        Path to the output file, or a glob pattern that will match 0 or 1 files.
+
+    glob_recursive
+        Passed to the `recursive` parameter of :func:`glob.glob` when finding all
+        the input files and the output file.
+    """
+    def __init__(self, from_pattern: str, to_file: pathlike, glob_recursive: bool = False,
+                 how: UpdateCheckMethod = UpdateByMtime()) -> None:
+        to_pattern = str(to_file)
+        to_file = Path(to_file)
+
+        if not to_file.exists():
+            possible_files = glob(to_pattern, recursive=glob_recursive)
+            if len(possible_files) == 0:
+                to_file = to_pattern
+            elif len(possible_files) == 1:
+                to_file = possible_files[0]
+            else:
+                raise DependencyError('Multiple files matched the pattern "{}"'.format(to_file))
+
+        self._from_pattern = from_pattern
+        self._to_file = to_file
+        self._to_pattern = to_pattern
+        self._glob_recursive = glob_recursive
+        self._how = how
+
+    def get_files_to_update(self) -> strseq:
+        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        if self.is_out_of_date(input_files, self._to_file, how=self._how, output_alt_path_key=self._to_pattern):
+            return (str(self._to_file), )
+        else:
+            return tuple()
+
+    def get_dependency_pairs(self, how: UpdateCheckMethod = UpdateByMtime()) -> Tuple[Tuple[str, str]]:
+        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        return tuple((str(i), str(self._to_file)) for i in input_files)
+
+    def set_files_updated(self):
+        input_files, output_files = self.get_input_output_files()
+        self.mark_updated(input_files, output_files[0], how=self._how, output_alt_path_key=self._to_pattern)
+
+    def iter_files(self):
+        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        output_file = str(self._to_file)
+        for input_file in input_files:
+            yield str(input_file), output_file
 
 
 class ParsingError(Exception):

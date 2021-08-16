@@ -118,11 +118,15 @@ class TreeNode:
 
 class Dependency(ABC):
     @abstractmethod
-    def get_files_to_update(self) -> strseq:
+    def get_files_to_update(self) -> Sequence[TreeNode]:
         pass
 
     @abstractmethod
     def get_dependency_pairs(self) -> Tuple[Tuple[str, str]]:
+        pass
+
+    @abstractmethod
+    def get_obsolete_files(self) -> Sequence[TreeNode]:
         pass
 
     @abstractmethod
@@ -144,7 +148,7 @@ class Dependency(ABC):
 
     @classmethod
     def can_be_removed(cls, input_files: strseq, output_file: str):
-        return len(input_files) == 0
+        return len(input_files) == 0 and Path(output_file).exists()
 
     @classmethod
     def mark_updated(cls, input_files: strseq, output_file: str, how: UpdateCheckMethod = UpdateByMtime(),
@@ -224,6 +228,13 @@ class OneToOnePatternDependency(Dependency):
             pairs.append((str(input_file), str(output_file)))
         return tuple(pairs)
 
+    def get_obsolete_files(self) -> Sequence[TreeNode]:
+        obsolete = []
+        for input_file, output_file in self.iter_files():
+            if self.can_be_removed([input_file], output_file):
+                obsolete.append(TreeNode(output_file, [input_file]))
+        return obsolete
+
     def set_files_updated(self):
         for input_file, output_file in self.iter_files():
             self.mark_updated([input_file], output_file, how=self._how)
@@ -273,7 +284,7 @@ class ManyToOnePatternDependency(Dependency):
         self._how = how
 
     def get_files_to_update(self) -> Sequence[TreeNode]:
-        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        input_files = self._get_input_files()
         if self.is_out_of_date(input_files, self._to_file, how=self._how):
             return (TreeNode(self._to_file, input_files), )
         else:
@@ -282,15 +293,25 @@ class ManyToOnePatternDependency(Dependency):
     def get_dependency_pairs(self) -> Tuple[Tuple[str, str]]:
         return tuple(p for p in self.iter_files())
 
+    def get_obsolete_files(self) -> Sequence[TreeNode]:
+        input_files = self._get_input_files()
+        if self.can_be_removed(input_files, self._to_file):
+            return [TreeNode(self._to_file, input_files)]
+        else:
+            return []
+
     def set_files_updated(self):
         input_files, output_files = self.get_input_output_files()
         self.mark_updated(input_files, output_files[0], how=self._how)
 
     def iter_files(self):
-        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        input_files = self._get_input_files()
         output_file = str(self._to_file)
         for input_file in input_files:
             yield str(input_file), output_file
+
+    def _get_input_files(self):
+        return glob(self._from_pattern, recursive=self._glob_recursive)
 
 
 class ManyToVariableOnePatternDependency(Dependency):
@@ -358,18 +379,28 @@ class ManyToVariableOnePatternDependency(Dependency):
             return tuple()
 
     def get_dependency_pairs(self, how: UpdateCheckMethod = UpdateByMtime()) -> Tuple[Tuple[str, str]]:
-        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        input_files = self._get_input_files()
         return tuple((str(i), str(self._to_file)) for i in input_files)
+
+    def get_obsolete_files(self) -> Sequence[TreeNode]:
+        input_files = self._get_input_files()
+        if self.can_be_removed(input_files, self._to_file):
+            return [TreeNode(self._to_file, input_files)]
+        else:
+            return []
 
     def set_files_updated(self):
         input_files, output_files = self.get_input_output_files()
         self.mark_updated(input_files, output_files[0], how=self._how, output_alt_path_key=self._to_pattern)
 
     def iter_files(self):
-        input_files = glob(self._from_pattern, recursive=self._glob_recursive)
+        input_files = self._get_input_files()
         output_file = str(self._to_file)
         for input_file in input_files:
             yield str(input_file), output_file
+
+    def _get_input_files(self):
+        return glob(self._from_pattern, recursive=self._glob_recursive)
 
 
 class ParsingError(Exception):
